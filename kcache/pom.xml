@@ -7,11 +7,15 @@
         <version>4.0.9-SNAPSHOT</version>
     </parent>
 
-    <groupId>io.kcache</groupId>
+    <groupId>guru.bonacci.kcache</groupId>
     <artifactId>kcache</artifactId>
     <packaging>jar</packaging>
 
     <dependencies>
+	    <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka</artifactId>
+        </dependency>
         <dependency>
             <groupId>com.google.guava</groupId>
             <artifactId>guava</artifactId>

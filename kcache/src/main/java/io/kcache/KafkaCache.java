@@ -16,20 +16,30 @@
 
 package io.kcache;
 
-import io.kcache.CacheUpdateHandler.ValidationStatus;
-import io.kcache.KafkaCacheConfig.Offset;
-import io.kcache.exceptions.CacheException;
-import io.kcache.exceptions.CacheInitializationException;
-import io.kcache.exceptions.CacheTimeoutException;
-import io.kcache.exceptions.EntryTooLargeException;
-import io.kcache.utils.InMemoryBoundedCache;
-import io.kcache.utils.InMemoryCache;
-import io.kcache.utils.ShutdownableThread;
-import io.kcache.utils.OffsetCheckpoint;
+import java.io.IOException;
 import java.lang.reflect.Constructor;
+import java.time.Duration;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
+
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.AdminClientConfig;
 import org.apache.kafka.clients.admin.Config;
@@ -42,9 +52,7 @@ import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.InvalidOffsetException;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndTimestamp;
-import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.Partitioner;
-import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.RecordMetadata;
@@ -65,31 +73,28 @@ import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.serialization.Serde;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.SendResult;
+import org.springframework.util.concurrent.ListenableFuture;
 
-import java.io.IOException;
-import java.time.Duration;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Properties;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.locks.Condition;
-import java.util.concurrent.locks.ReentrantLock;
-import java.util.stream.Collectors;
+import io.kcache.CacheUpdateHandler.ValidationStatus;
+import io.kcache.KafkaCacheConfig.Offset;
+import io.kcache.exceptions.CacheException;
+import io.kcache.exceptions.CacheInitializationException;
+import io.kcache.exceptions.CacheTimeoutException;
+import io.kcache.exceptions.EntryTooLargeException;
+import io.kcache.utils.InMemoryBoundedCache;
+import io.kcache.utils.InMemoryCache;
+import io.kcache.utils.OffsetCheckpoint;
+import io.kcache.utils.ShutdownableThread;
 
 public class KafkaCache<K, V> implements Cache<K, V> {
 
     private static final Logger log = LoggerFactory.getLogger(KafkaCache.class);
 
+    @Autowired KafkaTemplate<byte[], byte[]> producer;
+    
     private String topic;
     private int desiredReplicationFactor;
     private int desiredNumPartitions;
@@ -110,7 +115,6 @@ public class KafkaCache<K, V> implements Cache<K, V> {
     private String checkpointDir;
     private int checkpointVersion;
     private String bootstrapBrokers;
-    private Producer<byte[], byte[]> producer;
     private Partitioner partitioner;
     private Consumer<byte[], byte[]> consumer;
     private WorkerThread kafkaTopicReader;
@@ -282,7 +286,6 @@ public class KafkaCache<K, V> implements Cache<K, V> {
         this.consumer = new KafkaConsumer<>(getConsumerProperties());
         if (!readOnly) {
             Properties producerProperties = getProducerProperties();
-            this.producer = new KafkaProducer<>(producerProperties);
             ProducerConfig producerConfig = new ProducerConfig(producerProperties);
             this.partitioner = producerConfig.getConfiguredInstance(
                 ProducerConfig.PARTITIONER_CLASS_CONFIG,
@@ -344,7 +347,7 @@ public class KafkaCache<K, V> implements Cache<K, V> {
         return consumerProps;
     }
 
-    private Properties getProducerProperties() {
+    private Properties getProducerProperties() { // unused 
         Properties producerProps = new Properties();
         addKafkaCacheConfigsToClientProperties(producerProps);
         producerProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapBrokers);
@@ -352,8 +355,7 @@ public class KafkaCache<K, V> implements Cache<K, V> {
         producerProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class);
         producerProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class);
         producerProps.put(ProducerConfig.RETRIES_CONFIG, 0); // Producer should not retry
-        producerProps.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, false);
-
+        
         return producerProps;
     }
 
@@ -538,7 +540,9 @@ public class KafkaCache<K, V> implements Cache<K, V> {
             // write to the Kafka topic
             ProducerRecord<byte[], byte[]> producerRecord = toRecord(headers, key, value);
             log.trace("Sending record to Kafka cache topic: {}", producerRecord);
-            Future<RecordMetadata> ack = producer.send(producerRecord);
+            ListenableFuture lack = producer.send(producerRecord);
+            Future<RecordMetadata> ack = 
+                lack.completable().thenApply(result -> ((SendResult)result).getRecordMetadata());
             if (flush) {
                 producer.flush();
             }
@@ -577,7 +581,8 @@ public class KafkaCache<K, V> implements Cache<K, V> {
                 // write to the Kafka topic
                 ProducerRecord<byte[], byte[]> producerRecord = toRecord(headers, key, value);
                 log.trace("Sending record to Kafka cache topic: {}", producerRecord);
-                ack = producer.send(producerRecord);
+                ListenableFuture lack = producer.send(producerRecord);
+                ack = lack.completable().thenApply(result -> ((SendResult)result).getRecordMetadata());
             }
             if (flush) {
                 producer.flush();
@@ -752,7 +757,7 @@ public class KafkaCache<K, V> implements Cache<K, V> {
             }
         }
         if (producer != null) {
-            producer.close();
+            producer.destroy();
             log.info("Kafka cache producer shut down for {}", clientId);
         }
         localCache.close();
