@@ -524,6 +524,10 @@ public class KafkaCache<K, V> implements Cache<K, V> {
         return put(null, key, value).getOldValue();
     }
 
+    public V rollbackPut(K key) {
+        return localCache.remove(key);
+    }
+
     public Metadata<V> put(Headers headers, K key, V value) {
         return put(headers, key, value, false);
     }
